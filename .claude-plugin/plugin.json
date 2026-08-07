@@ -1,0 +1,11 @@
+{
+  "name": "write-session",
+  "description": "Bounded SESSION.md checkpoint for surviving /clear. A Stop hook keeps git state and a capped turn tail current at zero model tokens; /write-session adds the narrative half in a single request.",
+  "version": "0.1.0",
+  "author": {
+    "name": "androsland"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/androsland/write-session",
+  "keywords": ["context", "session", "checkpoint", "tokens", "hooks", "clear"]
+}
