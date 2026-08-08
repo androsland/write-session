@@ -7,7 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-d97757">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-informational">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.1-informational">
   <img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-0-brightgreen">
 </p>
 
@@ -37,6 +37,48 @@ Split the checkpoint in two, and give the halves different owners.
 Git already knows the mechanical half — asking a language model to restate it is paying
 for a `git status`. So only the narrative half touches the model, only once, at the
 boundary where you were going to `/clear` anyway.
+
+## What it writes to disk — read this first
+
+`SESSION.md` contains **excerpts of your conversation**: the last few assistant messages,
+truncated to 400 characters each, plus your branch name, commit subjects and the paths of
+your dirty files. By default it is written **into your repo root**.
+
+- It is kept out of commits via `.git/info/exclude`, verified with `git check-ignore` on
+  every turn. Two entries are written, `/SESSION.md` and `/SESSION.md.tmp-*` — the second
+  covers the temp file a killed process can leave behind, which holds the same content and
+  which the exact-name pattern would not match. If verification fails — most often because
+  the repo already tracks a `SESSION.md` — the hook writes a **visible warning into the file
+  itself** rather than failing silently. A `git add -f SESSION.md` still overrides the
+  exclude; nothing can stop that.
+- Assistant text **and git metadata** are scrubbed for high-confidence secret shapes
+  (private keys, `sk-`/`sk_live_`/`ghp_`/`npm_`/`pypi-`/`xox`-style tokens, AWS/Google keys,
+  JWTs, `Bearer`/`Basic` headers, `PASSWORD=`/`TOKEN=`/`CONNECTION_STRING=` assignments,
+  credentials in URLs). Git metadata goes through the same scrubber because it lands in the
+  file with no one typing anything — a branch named after a token, or a commit subject that
+  quotes one, is the more automatic of the two paths. **This is best effort, not a
+  guarantee** — it cannot recognise a secret that looks like ordinary prose. Set
+  `WRITE_SESSION_REDACT=0` to turn it off, never treat its output as safe to publish.
+- The hook runs `git status`, `git log`, `git diff --shortstat`, `git rev-parse` and
+  `git check-ignore` at the end of **every turn**, in whatever repo you have open. Cheap and
+  read-only, but it is process execution you did not have before.
+- The repo root and `cwd` are written into the file verbatim, and on most machines those
+  paths embed your OS username (`/home/you/…`, `C:\Users\You\…`). If you paste `SESSION.md`
+  anywhere, that goes with it.
+- Turn history lives under `~/.claude/write-session/`, pruned after 7 days. With
+  `WRITE_SESSION_LOCATION=home` the `SESSION.md` itself also lives there, and is retired by
+  the same 7-day sweep once no live turn file sits beside it.
+- A temp file orphaned by a killed process (`SESSION.md.tmp-<pid>`, holding the same content
+  as `SESSION.md`) is swept after an hour **in both locations** — the state directory and,
+  in the default configuration, your repo root. Only names this hook itself writes are
+  matched, so a file of yours that merely contains `.tmp-` is never touched.
+- **The default repo-root `SESSION.md` has no automatic expiry.** The 7-day sweep above
+  applies to the state directory, not to your repo — the file in your repo is rewritten
+  every turn and persists until you delete it or uninstall. Retention is bounded on the
+  state-directory path and unbounded, by design, on the default one.
+
+If any of that is unwanted: `WRITE_SESSION_LOCATION=home` keeps `SESSION.md` out of the repo
+entirely, and `WRITE_SESSION=0` disables the plugin.
 
 ## Quick start
 
@@ -135,14 +177,19 @@ Environment variables only.
 |---|---|---|
 | `WRITE_SESSION=0` | — | Disable entirely (`CLAUDE_SESSION_MD=0` also honored) |
 | `WRITE_SESSION_LOCATION=home` | `repo` | Never write inside the repo; keep `SESSION.md` under the state dir |
-| `WRITE_SESSION_GIT_EXCLUDE=0` | on | Do not touch `.git/info/exclude` |
+| `WRITE_SESSION_GIT_EXCLUDE=0` | on | Do not touch `.git/info/exclude` (the ignore check still runs) |
+| `WRITE_SESSION_REDACT=0` | on | Disable best-effort secret scrubbing — of turn text **and** of git metadata (branch, commit subjects, dirty paths) |
 | `WRITE_SESSION_MAX_TURNS` | `6` | Ring buffer depth (1–50) |
 | `WRITE_SESSION_MAX_TURN_CHARS` | `400` | Per-turn truncation (80–4000) |
 | `WRITE_SESSION_MAX_DIRTY` | `15` | Dirty files listed before eliding (1–200) |
 | `WRITE_SESSION_STATE_DIR` | `~/.claude/write-session` | Override the state root |
 
 Inside a git repo, `SESSION.md` is added to `.git/info/exclude` — local-only, never appears
-in a diff, never touches your tracked `.gitignore`.
+in a diff, never touches your tracked `.gitignore`. The path is resolved with
+`git rev-parse --git-path`, so it lands in the **common** git dir and works from inside a
+linked worktree, where `.git/worktrees/<name>/info/exclude` would be silently ignored by git.
+The result is then verified with `git check-ignore`; if the file is still not ignored, the
+hook says so in the file rather than assuming it worked.
 
 ## Requirements
 
@@ -172,8 +219,14 @@ Stated explicitly, because an unstated limit is indistinguishable from a claim o
 - **It should not fire on a repo that tracks a shared `SESSION.md`.** The
   `.git/info/exclude` entry is inert for an already-tracked path, so the file stays tracked
   — and the hook rewrites its auto region every turn, showing up as a permanent uncommitted
-  modification. If your team commits a `SESSION.md`, set `WRITE_SESSION_LOCATION=home` or
+  modification. The `check-ignore` verification detects exactly this case and puts a warning
+  banner in the file, but it cannot resolve it for you: set `WRITE_SESSION_LOCATION=home` or
   `WRITE_SESSION=0`.
+- **Secret scrubbing is pattern-matching, and pattern-matching has a floor.** It catches
+  recognisable credential shapes. It cannot catch a password that looks like a word, an
+  internal hostname, a customer name, or anything whose sensitivity comes from context
+  rather than form. On a repo where the conversation itself is confidential, keep
+  `SESSION.md` out of the tree with `WRITE_SESSION_LOCATION=home`.
 - **It cannot see whether a turn mattered.** There is no notion of importance: a throwaway
   "what's the weather" turn evicts a design decision from the 6-slot ring exactly as
   readily as anything else. The ring is recency, not relevance — which is precisely why the
@@ -197,6 +250,93 @@ never sees a torn file. The lock **fails open** — a lock that cannot be taken 
 reason to skip the checkpoint.
 
 The hook always exits 0 and swallows every error. It cannot block a turn.
+
+## Untrusted input
+
+`SESSION.md` is designed to be read back into a fresh agent session, which makes everything
+in it agent input. Commit subjects, branch names and file paths come from whoever wrote the
+repo — not from you — so every git-derived string is markdown-neutralised (`<`, `>` and
+backticks are replaced) and length-capped before interpolation. Region markers are matched
+line-anchored and the splice takes the **last** `auto:end`, so a forged marker cannot move
+the boundary and strand a fabricated "Next steps" section in your narrative. Clone a hostile
+repo and the worst it gets is odd-looking text inside a code span.
+
+## Tests
+
+```bash
+node test/run.mjs
+```
+
+207 assertions, no framework and no dependencies. `core.test.mjs` (49) covers normal
+operation, caps, concurrency, kill switches, markerless adoption and manifest validity;
+`hardening.test.mjs` (158) is regression coverage for the worktree-exclude and
+marker-forgery bugs fixed in 0.1.1, plus redaction of both turn text and git metadata, the
+tracked-file warning, TTL and temp-file sweeping, symlink guards, and timing assertions that
+every redaction pattern stays linear on a 64 KB adversarial corpus. Each suite builds
+throwaway git repos under the system temp dir and removes them when it finishes.
+
+The secret-redaction tests are worth a note, because three earlier versions of them claimed
+coverage they did not have, and each failure was silent:
+
+- The ReDoS corpus timed **one** occurrence of each token prefix — the one shape that
+  *cannot* trigger a restart-per-boundary blowup. It reported 18 ms while two patterns were
+  quadratic. It now repeats every prefix against eight separators.
+- The regex that scraped patterns out of the source required a `[` immediately before the
+  literal, so a pattern written across several lines was never timed at all: 14 of 15, with
+  nothing to indicate the fifteenth was missing. It is now line-anchored and cross-checks
+  the count of extracted patterns against the count declared in the source.
+- The length-sensitivity tests asserted only that the hook **finished quickly**, never that
+  the secret was gone. That is how a fix which stopped redacting oversized tokens entirely
+  passed a green suite. Every such case now asserts the secret is *absent* from the
+  resulting `SESSION.md`, and each was confirmed to fail against the broken version.
+
+A fourth: the linear-scaling assertion used to run only for patterns slower than 30 ms, so
+when the patterns got fast enough it stopped running altogether and the assertion count just
+dropped by one. It now always runs for the three slowest, and falls back to an absolute
+bound when a pattern is too fast to time a meaningful ratio.
+
+A fifth, and the one worth generalising from: after the JWT and assignment patterns were
+fixed for exactly this defect, a *third* pattern with the same shape sat untested beside
+them. The URL-credential tests used 9- and 18-character passwords, so they could not fail at
+the length that mattered, and the pattern silently missed any credential past 256 characters.
+Fixing a bug is not the same as sweeping for its siblings; the boundary is now asserted on
+both sides — the longest length that redacts and the shape that provably does not.
+
+Six assertions self-skip on Windows: a dirty path carrying a forged marker (Windows forbids
+`<` and `>` in filenames — the commit-subject vector exercises the same sanitizer), and
+five symlink cases (creating a symlink needs elevation). Run `node test/run.mjs` under WSL
+or Linux for the full 207.
+
+### Known limits, stated rather than implied
+
+- **A secret needs more than 256 characters between the keyword and the `=` to escape the
+  assignment pattern** (`VERY_LONG_..._SECRET_..._NAME=value`). The bound exists because an
+  unbounded span there is quadratic; 256 covers every realistic identifier, and the suite
+  asserts this limit explicitly so it cannot be mistaken for full coverage.
+- **On Windows, `writeAtomic`'s fallback cannot refuse a symlink at the syscall level.** It
+  opens with `O_NOFOLLOW`, which does not exist on Windows and degrades to a plain create.
+  Creating a symlink there requires elevation or developer mode; the primary rename path is
+  safe on both platforms, and the fallback only runs when `rename` itself fails.
+- **Redaction cannot see a secret that looks like prose** — an internal hostname, a customer
+  name, a password that is a dictionary word. No pattern set fixes this; it is why the
+  scrubber is documented as a seatbelt rather than a guarantee.
+- **A repo-root temp file is swept on the next turn in that repo, not on a timer.** The hook
+  only runs while you are working, so if a process is killed and you never open that repo
+  again, the orphan stays — git-excluded, but present. Closing that would need a background
+  process, which this deliberately is not.
+- **The state-root sweep stops at anything it did not write.** That is the safety rule, and
+  it is also a limit: a foreign file parked in a per-anchor state directory keeps that
+  directory, and the `SESSION.md` in it, alive past the TTL. The hook's own leftovers are
+  handled — a `.lock` orphaned by a killed process is reclaimed once it is itself 7 days old,
+  which also releases the `SESSION.md` it was holding — but anything else is left where it is,
+  on purpose. If you care about the retention window, don't store your own files under
+  `~/.claude/write-session/`.
+- **A killed session can delay one file's retirement by up to a further 7 days.** A `.lock` is
+  stamped when its owner takes it and blocks retirement of the `SESSION.md` beside it until the
+  lock is itself past the TTL — that is what stops a sweep deleting a file a slow-but-live run
+  has not read yet. Normally both age together and it costs nothing. The exception is a session
+  that died on its first turn after a long gap, leaving a fresh lock beside an already-old file.
+  Unlike the limit above, nothing you do avoids this one; it is bounded, not open-ended.
 
 ## Uninstall
 

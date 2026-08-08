@@ -22,11 +22,21 @@
  * Writes nothing to stdout, so it never injects tokens into the conversation.
  * Never blocks: all failures are swallowed and the process always exits 0.
  *
+ * THREAT MODEL. SESSION.md is designed to be re-read into a fresh agent session, so
+ * anything that reaches it is effectively agent input. Two untrusted sources feed it:
+ *   1. git metadata — commit subjects, branch names and dirty paths are controlled by
+ *      whoever wrote the repo, not by the user. They are markdown-neutralised by
+ *      mdsafe() so they can never forge a region marker (see spliceAuto).
+ *   2. assistant text — condensed, secret-scrubbed (best effort) and truncated.
+ * Marker lookup is line-anchored and takes the LAST auto:end, so even a marker that
+ * somehow survived could not move the splice boundary.
+ *
  * Configuration — environment variables only. No config file, no prompts.
  *   WRITE_SESSION=0                  disable entirely (CLAUDE_SESSION_MD=0 also honored)
  *   WRITE_SESSION_LOCATION=home      never write inside the repo; keep SESSION.md under
  *                                    the state dir instead (default: repo)
  *   WRITE_SESSION_GIT_EXCLUDE=0      do not touch .git/info/exclude
+ *   WRITE_SESSION_REDACT=0           disable best-effort secret scrubbing (not advised)
  *   WRITE_SESSION_MAX_TURNS=6        ring buffer depth        (1-50)
  *   WRITE_SESSION_MAX_TURN_CHARS=400 per-turn truncation      (80-4000)
  *   WRITE_SESSION_MAX_DIRTY=15       dirty files listed       (1-200)
@@ -45,15 +55,26 @@ function num(name, dflt, min, max) {
   const v = parseInt(ENV[name] || '', 10);
   return Number.isFinite(v) && v >= min && v <= max ? v : dflt;
 }
-const isOff = (name) => (ENV[name] || '').toLowerCase() === '0' || (ENV[name] || '').toLowerCase() === 'false';
+const isOff = (name) => ['0', 'false'].includes((ENV[name] || '').toLowerCase());
 
 const MAX_TURNS = num('WRITE_SESSION_MAX_TURNS', 6, 1, 50);
 const MAX_TURN_CHARS = num('WRITE_SESSION_MAX_TURN_CHARS', 400, 80, 4000);
 const MAX_DIRTY = num('WRITE_SESSION_MAX_DIRTY', 15, 1, 200);
 const MIN_TURN_CHARS = 15; // skip "Done." and friends
 const MAX_SUBJECT = 72;
+const MAX_PATH_CHARS = 120;
 const GIT_TIMEOUT = 4000;
-const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // prune per-session turn files after a week
+// Prune per-session turn files after a week. This also reclaims an abandoned `.lock`
+// (see sweepStaleState), which loads it with a second, non-obvious requirement: it must stay
+// FAR above the longest a legitimate critical section can hold the lock — today ~24 s, from
+// six in-lock git subprocesses at GIT_TIMEOUT apiece. Shortened toward that, the sweep's own
+// rmdirSync starts breaking locks live processes still hold, which is the exact bug the
+// two rejected versions of that branch were rejected for. Nothing enforces this; it is not
+// reachable today only because none of these three constants is env-configurable. If you ever
+// make retention tunable, give the lock its own floor rather than letting it ride this one.
+const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TMP_TTL_MS = 60 * 60 * 1000; // orphaned half-written temp files: an hour is generous
+const SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_MS = 15000;
 const LOCK_WAIT_MS = 3000;
 
@@ -61,6 +82,32 @@ const AUTO_START = '<!-- session-md:auto:start -->';
 const AUTO_END = '<!-- session-md:auto:end -->';
 const NARR_START = '<!-- session-md:narrative:start -->';
 const NARR_END = '<!-- session-md:narrative:end -->';
+
+// Line-anchored so a marker embedded mid-line (e.g. inside a commit subject that
+// slipped through) can never be mistaken for a real region boundary.
+//
+// A bare `$`, deliberately, and this took two wrong turns to get right. CRLF needs no
+// special handling: `\r` is a JavaScript line terminator, so in multiline mode `$` already
+// asserts before a `\r\n` and a Windows-saved SESSION.md is parsed correctly either way.
+// An earlier revision claimed a bare `$` "matched nothing and discarded the whole auto
+// region" and added `\r?` to fix it. That diagnosis was wrong, and the remedy made things
+// slightly worse: spliceAuto resumes at `endMatch.index + endMatch[0].length`, so a `\r?`
+// that CONSUMES the marker line's carriage return hands back a tail starting at the bare
+// `\n`, turning a clean `\r\n\r\n` into a mixed `\n\r\n`. Measured on a CRLF fixture, three
+// splices deep: bare `$` leaves 2 lone LFs, `\r?$` leaves 3. Identical on an LF file.
+const RE_AUTO_START = /^<!-- session-md:auto:start -->$/m;
+const RE_AUTO_END = /^<!-- session-md:auto:end -->$/gm;
+
+// Temp files are named so they are recognisable to the git exclude and the sweep. Both
+// matter: writeAtomic can only clean up after an exception, never after a SIGKILL.
+const TMP_SUFFIX = '.tmp-';
+
+// Anchored to the two basenames this hook actually writes, because the sweep below DELETES
+// what this matches. A bare `.includes('.tmp-')` test — which is what this replaced — would
+// have retired any file whose name merely contains that substring: someone's
+// `notes.tmp-2026.md` parked in the state directory is not ours to remove, and the rule the
+// adjacent branch states ("never delete anything but our own files") has to hold here too.
+const RE_OUR_TMP = /^(?:SESSION\.md|turns-.+\.json)\.tmp-\d+$/;
 
 const NARRATIVE_SEED = `## Where we are
 
@@ -75,6 +122,132 @@ _Not written yet — run \`/write-session\` before \`/clear\` to fill this in._
 ## Key files
 `;
 
+/**
+ * Best-effort secret scrubbing. This is a seatbelt, NOT a guarantee: it matches
+ * high-confidence shapes only and cannot recognise a secret that looks like ordinary
+ * prose. Documented as best-effort in the README precisely so nobody treats a scrubbed
+ * SESSION.md as safe to publish.
+ */
+// Every pattern here must be LINEAR in input length. This hook runs on every turn with a
+// 15s harness timeout, and two earlier drafts were quadratic: an unbounded `[a-z0-9+.-]*`
+// before `://` cost 34.7s on a 200KB message, and `BEGIN…[\s\S]*?…END` re-scanned the
+// remaining string once per BEGIN when no END ever appeared. Both are fixed below by
+// bounding the spans; if you add a pattern, time it against a 200KB adversarial input.
+const SECRET_PATTERNS = [
+  // Single greedy base64/whitespace class with an OPTIONAL closer: consumes the whole key
+  // body in one pass and cannot backtrack across repeated BEGIN headers.
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]*(?:-----END [A-Z ]*PRIVATE KEY-----)?/g, '⟨redacted:private-key⟩'],
+  [/\bsk-ant-[A-Za-z0-9_-]{16,}/g, '⟨redacted⟩'],
+  [/\bsk-[A-Za-z0-9]{20,}/g, '⟨redacted⟩'],
+  // Stripe and friends are underscore-delimited, so the sk- pattern above misses them.
+  [/\b[a-z]{2}_(?:live|test)_[A-Za-z0-9]{16,}/g, '⟨redacted⟩'],
+  [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, '⟨redacted⟩'],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, '⟨redacted⟩'],
+  [/\bnpm_[A-Za-z0-9]{20,}/g, '⟨redacted⟩'],
+  [/\bpypi-[A-Za-z0-9_-]{20,}/g, '⟨redacted⟩'],
+  [/\bxox[baprse]-[A-Za-z0-9-]{10,}/g, '⟨redacted⟩'],
+  [/\bAKIA[0-9A-Z]{16}/g, '⟨redacted⟩'],
+  // A real Google key is AIza + exactly 35, but pinning the length makes the filter
+  // miss anything truncated or mistyped. Over-matching here costs nothing.
+  [/\bAIza[0-9A-Za-z_-]{30,}/g, '⟨redacted⟩'],
+  // One greedy run over the WHOLE token, dots included, with nothing required after it.
+  // That last part is the entire point: a required literal after an unbounded quantifier is
+  // what makes a pattern backtrack, so a pattern with no trailing requirement cannot blow
+  // up no matter how long the input — 0.7 ms on `eyJ-`.repeat(16384), versus 1886 ms for
+  // the three-segment version this replaces.
+  //
+  // The obvious alternative — keep three segments and bound each one — was tried and
+  // reverted, because bounding a span does not truncate a long match, it FAILS the match.
+  // At {8,1024} a JWT with a 1100-char segment came through entirely in cleartext (\b only
+  // fires at the true start of the token, so no later position can rescue it). That is a
+  // redaction hole introduced by a performance fix, and strictly worse than the ReDoS it
+  // was closing. Over-matching is the safe direction here: worst case this redacts a long
+  // base64 blob that was not a JWT, which costs nothing.
+  [/\beyJ[A-Za-z0-9_.-]{40,}/g, '⟨redacted:jwt⟩'],
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}/gi, '$1 ⟨redacted⟩'],
+  [
+    // Only the SUFFIX is bounded, and that asymmetry is load-bearing. The quadratic came
+    // from the suffix alone: at each of the O(n) positions where the keyword alternation
+    // matched, an unbounded suffix rescanned to end-of-string hunting the `=`. The prefix
+    // backtracks once, from the single position where \b fires, so it costs O(n) total and
+    // can stay unbounded — measured 902 ms unbounded-both vs 14 ms with only the suffix
+    // capped, on `DSN_`.repeat(n) at 64 KB.
+    //
+    // Bounding the prefix as well (the first attempt at this fix) silently stopped
+    // redacting any identifier with more than 64 characters before the keyword — a long
+    // `SPRING_DATASOURCE_..._PASSWORD=` leaked its value in full, because a failed bound
+    // fails the whole match rather than shortening it. Residual limit, stated rather than
+    // implied: more than 256 characters BETWEEN the keyword and the `=` still misses.
+    /\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|CONNECTION_STRING|DSN)[A-Z0-9_]{0,256})(\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|\S+)/gi,
+    '$1$2⟨redacted⟩',
+  ],
+  // The `@` has to stay a required literal — drop it and every `host:port` URL gets
+  // redacted — so this pattern cannot use the no-trailing-requirement trick the JWT one
+  // does. Only the SCHEME is bounded, and only because the scheme was the measured
+  // quadratic: unbounded it cost 34.7 s at 200 KB.
+  //
+  // The user and password runs are unbounded on purpose. Bounded at 256 they did exactly
+  // what the JWT bound did — missed the whole credential rather than part of it. A
+  // 257-character password came through in full cleartext, and that is not a contrived
+  // length: an Azure SAS token or a long API key used as a DSN password routinely exceeds
+  // it. Unbounding costs nothing measurable, because both character classes exclude `/`
+  // while every start position requires `://`, so no run can extend into the next
+  // candidate and the total stays linear — 1.7/6.6/26.5/103.7 ms at 16/64/256/1024 KB,
+  // against 1.3/5.2/19.5/78.6 ms bounded. Same slope, no cliff.
+  //
+  // The scheme bound costs no coverage, which is worth stating because the two bounds this
+  // replaces cost plenty. Nothing anchors this pattern to the start of the scheme, so on a
+  // 20-character scheme the match simply begins four characters later and the credential is
+  // still redacted (asserted at 8/16/17/40). It would only miss if none of the sixteen
+  // characters before `://` could start a run — no scheme, real or otherwise, looks like that.
+  [/([a-z][a-z0-9+.-]{0,15}:\/\/)[^\s/@:]*:[^\s/@]+@/gi, '$1⟨redacted⟩@'],
+];
+
+/**
+ * Cap before scanning. The output is truncated to MAX_TURN_CHARS regardless, so scanning
+ * a megabyte is pure waste — and it bounds the cost of every pattern above at a value we
+ * have actually measured rather than one we have argued for.
+ */
+const MAX_REDACT_CHARS = 64 * 1024;
+
+function redact(s) {
+  if (isOff('WRITE_SESSION_REDACT')) return s;
+  let out = s.length > MAX_REDACT_CHARS ? s.slice(0, MAX_REDACT_CHARS) : s;
+  for (const [re, rep] of SECRET_PATTERNS) out = out.replace(re, rep);
+  return out;
+}
+
+/**
+ * Neutralise text that will be interpolated into SESSION.md from an UNTRUSTED source
+ * (git metadata: commit subjects, branch names, dirty paths — all written by whoever
+ * authored the repo). Removing `<` and `>` makes an HTML-comment marker unforgeable;
+ * the backtick swap keeps the surrounding code span from breaking. Control characters go
+ * first so nothing can inject the line break the anchored marker regexes require.
+ *
+ * The class endpoints must stay written as \x escapes. Literal control bytes here parse
+ * fine and behave identically, but they make the whole file BINARY to git — which kills
+ * `git diff`, `git blame` and GitHub's web diff on the one file in this repo that most
+ * needs reviewing. That regression shipped once already.
+ */
+function mdsafe(s) {
+  return String(s)
+    .replace(/[\x00-\x1F\x7F]/g, ' ')
+    .replace(/</g, '‹')
+    .replace(/>/g, '›')
+    .replace(/`/g, "'")
+    .trim();
+}
+
+/**
+ * For git-derived text: secret-scrub FIRST, then neutralise.
+ *
+ * A commit subject or branch name is a well-known place for a credential to land by
+ * accident ("revert the AKIA… key"), and this hook re-persists them into SESSION.md every
+ * turn without the user typing anything. Scrubbing assistant text but not git metadata
+ * would leave the more automatic of the two paths unguarded.
+ */
+const gitsafe = (s) => mdsafe(redact(String(s)));
+
 function git(cwd, args) {
   try {
     return execFileSync('git', ['-C', cwd, ...args], {
@@ -85,6 +258,20 @@ function git(cwd, args) {
     }).trim();
   } catch {
     return '';
+  }
+}
+
+/** True when git exits 0. Used for check-ignore, where exit 1 is a real answer. */
+function gitOk(cwd, args) {
+  try {
+    execFileSync('git', ['-C', cwd, ...args], {
+      timeout: GIT_TIMEOUT,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -101,21 +288,25 @@ function truncate(s, n) {
   return s.length <= n ? s : s.slice(0, n - 1).trimEnd() + '…';
 }
 
-/** Collapse an assistant message to a single dense line. */
+/**
+ * Collapse an assistant message to a single dense, secret-scrubbed line.
+ * The list/heading rewrites run FIRST because they are line-anchored, and mdsafe()
+ * flattens newlines along with every other control character. mdsafe() runs LAST so
+ * assistant text goes through exactly the same scrubber as git metadata — in particular
+ * `>` becomes `›`, so a `-->` typed inside a message can never close a real marker.
+ */
 function condense(msg) {
-  return String(msg)
-    .replace(/```[\s\S]*?```/g, '⟨code⟩') // fenced blocks carry little state
+  const s = redact(String(msg).replace(/```[\s\S]*?```/g, '⟨code⟩'))
     .replace(/^\s*[-*]\s+/gm, '· ')
-    .replace(/[#>|]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/[#|]/g, ' ');
+  return mdsafe(s).replace(/\s+/g, ' ').trim();
 }
 
 function sleepSync(ms) {
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch {
-    /* SharedArrayBuffer unavailable — spin-free no-op, we just retry sooner */
+    /* SharedArrayBuffer unavailable — we just retry sooner */
   }
 }
 
@@ -133,12 +324,24 @@ function withLock(lockDir, fn) {
       break;
     } catch (e) {
       if (e.code !== 'EEXIST') return fn();
-      let age = Infinity;
+      let st = null;
       try {
-        age = Date.now() - fs.statSync(lockDir).mtimeMs;
+        st = fs.lstatSync(lockDir);
       } catch {
-        /* vanished between EEXIST and stat — loop and retry the mkdir */
+        /* vanished between EEXIST and lstat — loop and retry the mkdir */
       }
+      // A non-directory squatting on the lock path (a symlink, most likely) can never be
+      // cleared by rmdirSync — that throws ENOTDIR forever and wedges every turn on the
+      // 3s fail-open path. Unlink it and retry instead.
+      if (st && !st.isDirectory()) {
+        try {
+          fs.unlinkSync(lockDir);
+          continue;
+        } catch {
+          return fn();
+        }
+      }
+      const age = st ? Date.now() - st.mtimeMs : Infinity;
       if (age > LOCK_STALE_MS) {
         try {
           fs.rmdirSync(lockDir);
@@ -164,16 +367,45 @@ function withLock(lockDir, fn) {
 
 /** Same-volume rename is atomic: a concurrent reader never sees a torn file. */
 function writeAtomic(target, content) {
-  const tmp = `${target}.tmp-${process.pid}`;
+  const tmp = `${target}${TMP_SUFFIX}${process.pid}`;
   try {
     fs.writeFileSync(tmp, content);
     fs.renameSync(tmp, target);
   } catch {
+    // The rename path replaces a symlink with a regular file, so it is safe by
+    // construction. This fallback is not, and an lstat-then-writeFileSync here would only
+    // look safe: that is check-then-act, and someone able to write in this directory can
+    // swap a symlink in between the two calls — they can even force the rename above to
+    // fail on purpose to reach this branch. Open with O_NOFOLLOW instead, so the refusal
+    // happens inside the syscall and there is no window to race.
+    //
+    // O_NOFOLLOW does not exist on Windows (hence the `|| 0`), so on Windows this degrades
+    // to a plain create. Creating a symlink there needs elevation or developer mode, which
+    // makes the attack meaningfully harder but not impossible — stated as a limit rather
+    // than papered over.
+    let fd = null;
     try {
-      fs.writeFileSync(target, content);
+      const { O_WRONLY, O_CREAT, O_TRUNC, O_NOFOLLOW } = fs.constants;
+      fd = fs.openSync(target, O_WRONLY | O_CREAT | O_TRUNC | (O_NOFOLLOW || 0), 0o600);
+      fs.writeFileSync(fd, content);
     } catch {
-      /* give up silently */
+      /* ELOOP (a symlink was there) or anything else — give up silently */
+    } finally {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* already closed */
+        }
+      }
     }
+  } finally {
+    // Always, including the success path: a rename that half-failed can leave the temp
+    // behind. This only covers the exception path — a SIGKILL between write and rename
+    // cannot run JavaScript at all, which is why the temp name is BOTH git-excluded and
+    // swept by age. See ensureExcluded(), sweepStaleState() and sweepRepoTmp(). The last
+    // of those exists because sweepStaleState only walks the state root, while in the
+    // default configuration this temp file lands in the user's repo instead.
     try {
       fs.unlinkSync(tmp);
     } catch {
@@ -239,7 +471,14 @@ function readTurns(stateDir) {
   for (const n of names) {
     const f = path.join(stateDir, n);
     try {
-      if (now - fs.statSync(f).mtimeMs > STATE_TTL_MS) {
+      // lstat, and skip anything that is not a regular file. Without this a symlink named
+      // `turns-x.json` would have its target read and spliced into SESSION.md — the same
+      // hole the state-root sweep already guards against, and there is no reason for the
+      // two to disagree. (Reaching it needs write access to the user's own state tree, so
+      // the value here is consistency rather than a new boundary.)
+      const st = fs.lstatSync(f);
+      if (!st.isFile()) continue;
+      if (now - st.mtimeMs > STATE_TTL_MS) {
         fs.unlinkSync(f);
         continue;
       }
@@ -256,30 +495,237 @@ function readTurns(stateDir) {
 }
 
 /**
- * Keep SESSION.md out of commits without touching a tracked .gitignore:
- * .git/info/exclude is local-only and never shows in a diff.
- * Opt out with WRITE_SESSION_GIT_EXCLUDE=0 if your team commits SESSION.md.
+ * readTurns() only prunes a directory you come back to, so a repo visited once would
+ * keep its conversation excerpts forever. Sweep the whole state root, rate-limited to
+ * once a day so the per-turn cost stays at zero in the common case.
  */
-function ensureExcluded(repoRoot) {
-  const gitDir = git(repoRoot, ['rev-parse', '--absolute-git-dir']);
-  if (!gitDir) return;
-  const excludeFile = path.join(gitDir, 'info', 'exclude');
+function sweepStaleState(stateRoot) {
+  const marker = path.join(stateRoot, '.last-sweep');
   try {
-    const cur = fs.existsSync(excludeFile) ? fs.readFileSync(excludeFile, 'utf8') : '';
-    if (/^\/?SESSION\.md\s*$/m.test(cur)) return;
-    fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
-    fs.appendFileSync(
-      excludeFile,
-      (cur && !cur.endsWith('\n') ? '\n' : '') +
-        '\n# write-session (local scratch checkpoint)\n/SESSION.md\n',
-    );
+    if (Date.now() - fs.statSync(marker).mtimeMs < SWEEP_INTERVAL_MS) return;
   } catch {
-    /* read-only .git, submodule, whatever — not fatal */
+    /* never swept */
+  }
+  try {
+    fs.mkdirSync(stateRoot, { recursive: true });
+    fs.writeFileSync(marker, ''); // stamp first: a failing sweep must not retry every turn
+    const now = Date.now();
+    for (const d of fs.readdirSync(stateRoot)) {
+      const dir = path.join(stateRoot, d);
+      let entries;
+      try {
+        // lstat, not stat: a symlink planted in the shared state root would otherwise
+        // make readdirSync list its TARGET, and any stale `turns-*.json` there would be
+        // unlinked. Same reasoning as the lock-path guard — apply it consistently.
+        if (!fs.lstatSync(dir).isDirectory()) continue;
+        entries = fs.readdirSync(dir);
+      } catch {
+        continue; // not a directory (e.g. the marker itself), or unreadable
+      }
+      let live = 0;
+      let others = [];
+      for (const n of entries) {
+        // A crashed writeAtomic leaves `<name>.tmp-<pid>` holding the full assembled
+        // content. Its own finally cannot help — a SIGKILL runs no JavaScript — so sweep
+        // it here, on a much shorter clock than the 7-day TTL: a write that is genuinely
+        // still in flight is seconds old, never an hour.
+        if (RE_OUR_TMP.test(n)) {
+          try {
+            if (now - fs.lstatSync(path.join(dir, n)).mtimeMs > TMP_TTL_MS)
+              fs.unlinkSync(path.join(dir, n));
+            else others.push(n);
+          } catch {
+            others.push(n);
+          }
+          continue;
+        }
+        // A `.lock` left by a SIGKILL never clears itself: withLock breaks a stale lock only
+        // when a run takes that lock again, and an anchor nobody revisits never gets one. Left
+        // in `others` indefinitely, a zero-byte directory silently reopened the exact retention
+        // gap the orphan retirement below exists to close — `others.length === 1` can never
+        // hold, so the SESSION.md beside it is kept past the TTL for good.
+        //
+        // So an abandoned lock is treated as what it is — one more piece of dead state, on the
+        // same clock as everything else swept here. Until it reaches that age it counts toward
+        // `others` and blocks retirement, and THAT is the part carrying the safety: a writer
+        // holding the lock has not read SESSION.md yet. buildAutoBlock's git subprocesses run
+        // first (see main), so retiring the file out from under a slow-but-live run would leave
+        // it to adopt a fresh region and drop the human-written narrative without a word.
+        //
+        // An earlier revision split this in two, ignoring a lock for retirement purposes at
+        // withLock's LOCK_STALE_MS while reclaiming the directory only at STATE_TTL_MS. The
+        // reasoning was that not-counting is free where removing is not — true in itself, and
+        // it still opened the window above: the critical section runs six git subprocesses at
+        // GIT_TIMEOUT (4000 ms) apiece, so a legitimately slow run holds the lock for ~24s,
+        // well inside the band where the sweep had stopped counting it.
+        //
+        // Giving that band up costs less than it appears. A lock is stamped when its owner
+        // takes it, so in the ordinary case — a session killed during or between turns — it
+        // ages alongside the SESSION.md from those same turns and crosses the TTL at close to
+        // the same time. The worst case is a crash on the first turn after a long absence,
+        // where a fresh lock sits beside an already-old file and delays its retirement by up
+        // to STATE_TTL_MS beyond the file's own. Bounded, where the original bug was not.
+        if (n === '.lock') {
+          try {
+            const st = fs.lstatSync(path.join(dir, n));
+            // isDirectory() here is belt-and-braces, not load-bearing: a regular file or a
+            // symlink at this path makes rmdirSync throw ENOTDIR and land in the catch, which
+            // pushes it too, so no mutation of this clause changes an observable outcome. It
+            // stays because "only ever remove a directory" should be readable at the call site
+            // rather than inferred from an errno — and it is deliberately not teeth-checked,
+            // for the same reason it cannot be.
+            if (st.isDirectory() && now - st.mtimeMs > STATE_TTL_MS) fs.rmdirSync(path.join(dir, n));
+            else others.push(n);
+          } catch {
+            others.push(n);
+          }
+          continue;
+        }
+        if (!/^turns-.+\.json$/.test(n)) {
+          others.push(n); // never delete anything but our own files
+          continue;
+        }
+        const f = path.join(dir, n);
+        try {
+          if (now - fs.statSync(f).mtimeMs > STATE_TTL_MS) fs.unlinkSync(f);
+          else live++;
+        } catch {
+          live++;
+        }
+      }
+      // A non-repo cwd gets its SESSION.md written into this same directory, so the TTL
+      // above would age out the turn files and leave the excerpts they came from sitting
+      // here forever. Retire an orphan too: no live turn file beside it, nothing else in
+      // the directory, and its own mtime past the TTL.
+      if (!live && others.length === 1 && others[0] === 'SESSION.md') {
+        const f = path.join(dir, 'SESSION.md');
+        try {
+          const st = fs.lstatSync(f);
+          // Four conditions, all required: a plain file (never follow a symlink), past the
+          // TTL, small enough to be worth reading at all, and carrying BOTH of our region
+          // markers on their own lines. The marker check is what stops us deleting a
+          // same-named file someone else parked here — the name alone is not proof of
+          // authorship.
+          //
+          // It uses the line-anchored regexes rather than a substring test, and that is not
+          // pedantry: this project's own README and CHANGELOG quote the marker text, so a
+          // substring test would have accepted any document that merely mentions it — for
+          // instance someone's notes pasted into a stray SESSION.md. Requiring both markers,
+          // each alone on its line, is the same standard the region parser applies.
+          if (
+            st.isFile() &&
+            st.size < 256 * 1024 &&
+            now - st.mtimeMs > STATE_TTL_MS &&
+            ((body) => {
+              RE_AUTO_END.lastIndex = 0;
+              return RE_AUTO_START.test(body) && RE_AUTO_END.test(body);
+            })(fs.readFileSync(f, 'utf8'))
+          ) {
+            fs.unlinkSync(f);
+            others = [];
+          }
+        } catch {
+          /* leave it alone */
+        }
+      }
+      if (!live && !others.length) {
+        try {
+          fs.rmdirSync(dir); // succeeds only when genuinely empty
+        } catch {
+          /* not empty, or in use */
+        }
+      }
+    }
+  } catch {
+    /* sweeping is best effort */
   }
 }
 
+/**
+ * writeAtomic's temp file lands beside its target, and in the DEFAULT configuration the
+ * target is the user's repo root — a directory sweepStaleState never visits, because it
+ * only walks the state root. So a SIGKILL between write and rename left a full copy of the
+ * checkpoint (turn excerpts and all) sitting in the repo indefinitely: git-excluded, but
+ * never deleted. The temp-file sweep was therefore only ever complete for
+ * WRITE_SESSION_LOCATION=home, which is the configuration almost nobody runs.
+ *
+ * Only our own name shape is matched, and only past the same hour-long clock — a write
+ * that is genuinely still in flight, including one from a second Claude Code session in
+ * this repo, is seconds old and never an hour. One non-recursive readdir of the repo root
+ * per turn; the hook already spawns seven git subprocesses in the default configuration
+ * (six with WRITE_SESSION_GIT_EXCLUDE=0), so this is not the cost. Counted, not estimated —
+ * an earlier revision of this line said eight.
+ */
+function sweepRepoTmp(dir) {
+  const now = Date.now();
+  try {
+    for (const n of fs.readdirSync(dir)) {
+      if (!RE_OUR_TMP.test(n)) continue;
+      const f = path.join(dir, n);
+      try {
+        // lstat, so a symlink named like our temp file is aged on its own mtime and
+        // unlinked as itself — unlinkSync never follows, so the target is never touched.
+        if (now - fs.lstatSync(f).mtimeMs > TMP_TTL_MS) fs.unlinkSync(f);
+      } catch {
+        /* raced with another process, or not ours to touch */
+      }
+    }
+  } catch {
+    /* unreadable directory — nothing to do */
+  }
+}
+
+/**
+ * Resolve a path inside the git dir. Must go through `--git-path`, not
+ * `--absolute-git-dir`: inside a LINKED WORKTREE the latter yields the worktree-private
+ * git dir (.git/worktrees/<name>), whose info/exclude git never reads — so writing
+ * there silently fails to exclude anything. `--git-path` resolves to the common dir.
+ * Its output is absolute in a worktree but RELATIVE in a plain repo, so resolve it.
+ */
+function gitPath(repoRoot, rel) {
+  const out = git(repoRoot, ['rev-parse', '--git-path', rel]);
+  return out ? path.resolve(repoRoot, out) : '';
+}
+
+/**
+ * Keep SESSION.md out of commits without touching a tracked .gitignore:
+ * .git/info/exclude is local-only and never shows in a diff.
+ * Returns 'ok' | 'not-ignored' | 'skipped' — verified with check-ignore rather than
+ * assumed, because the failure modes here are silent (worktrees, read-only .git, or a
+ * SESSION.md the team already tracks, for which check-ignore correctly reports 1).
+ */
+function ensureExcluded(repoRoot) {
+  const excludeFile = gitPath(repoRoot, 'info/exclude');
+  if (!excludeFile) return 'skipped';
+  try {
+    const cur = fs.existsSync(excludeFile) ? fs.readFileSync(excludeFile, 'utf8') : '';
+    // Two entries, not one. `/SESSION.md` is an exact-name pattern, so it does NOT cover
+    // `SESSION.md.tmp-1234` — the temp file a killed process leaves behind, holding the
+    // same content. Excluded only by name it would sit there untracked and be swept up by
+    // the next `git add -A`, which needs no `-f` and no intent at all.
+    // The leading slash stays optional when DETECTING an existing entry, so a user who
+    // wrote the bare name by hand does not get a duplicate appended every run.
+    const want = [
+      ['/SESSION.md', /^\/?SESSION\.md\s*$/m],
+      ['/SESSION.md.tmp-*', /^\/?SESSION\.md\.tmp-\*\s*$/m],
+    ];
+    const missing = want.filter(([, re]) => !re.test(cur)).map(([line]) => line);
+    if (missing.length) {
+      fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
+      fs.appendFileSync(
+        excludeFile,
+        (cur && !cur.endsWith('\n') ? '\n' : '') +
+          `\n# write-session (local scratch checkpoint)\n${missing.join('\n')}\n`,
+      );
+    }
+  } catch {
+    /* read-only .git, submodule, whatever — fall through to the verification */
+  }
+  return gitOk(repoRoot, ['check-ignore', '-q', '--', 'SESSION.md']) ? 'ok' : 'not-ignored';
+}
+
 function buildGitBlock(cwd, repoRoot) {
-  if (!repoRoot) return `- Not a git repository (\`${cwd}\`).`;
+  if (!repoRoot) return `- Not a git repository (\`${gitsafe(cwd)}\`).`;
 
   const statusRaw = git(repoRoot, ['status', '--porcelain=v1', '-b']);
   const lines = statusRaw ? statusRaw.split(/\r?\n/) : [];
@@ -291,14 +737,20 @@ function buildGitBlock(cwd, repoRoot) {
   const shortstat = git(repoRoot, ['diff', '--shortstat', 'HEAD']);
   const recent = git(repoRoot, ['log', '-5', '--format=%h%x09%s']);
 
+  // Everything below is repo-author-controlled AND a place credentials land by accident,
+  // so every field gets gitsafe() (redact + neutralise) plus a length cap.
   const out = [];
-  out.push(`- **Branch** \`${branchLine}\``);
-  out.push(`- **HEAD** \`${headSha}\` ${truncate(headSubj, MAX_SUBJECT)}`.trimEnd());
-  out.push(`- **Root** \`${repoRoot}\``);
+  out.push(`- **Branch** \`${truncate(gitsafe(branchLine), MAX_PATH_CHARS)}\``);
+  out.push(`- **HEAD** \`${mdsafe(headSha)}\` ${truncate(gitsafe(headSubj), MAX_SUBJECT)}`.trimEnd());
+  out.push(`- **Root** \`${gitsafe(repoRoot)}\``);
 
   if (dirty.length) {
-    out.push(`- **Dirty** ${dirty.length} file(s)${shortstat ? ` — ${shortstat}` : ''}`);
-    for (const d of dirty.slice(0, MAX_DIRTY)) out.push(`  - \`${d}\``);
+    // gitsafe, not mdsafe. `--shortstat` is a fixed numeric summary with no filenames in
+    // it, so there is nothing here to redact today — but every other git-derived string on
+    // this path goes through gitsafe, and an exception that relies on the current output
+    // format of a git subcommand is a footgun for whoever edits this next.
+    out.push(`- **Dirty** ${dirty.length} file(s)${shortstat ? ` — ${gitsafe(shortstat)}` : ''}`);
+    for (const d of dirty.slice(0, MAX_DIRTY)) out.push(`  - \`${truncate(gitsafe(d), MAX_PATH_CHARS)}\``);
     if (dirty.length > MAX_DIRTY) out.push(`  - _…and ${dirty.length - MAX_DIRTY} more_`);
   } else {
     out.push('- **Dirty** clean');
@@ -308,25 +760,37 @@ function buildGitBlock(cwd, repoRoot) {
     out.push('- **Recent commits**');
     for (const r of recent.split(/\r?\n/)) {
       const [sha, subj = ''] = r.split('\t');
-      out.push(`  - \`${sha}\` ${truncate(subj, MAX_SUBJECT)}`.trimEnd());
+      out.push(`  - \`${mdsafe(sha)}\` ${truncate(gitsafe(subj), MAX_SUBJECT)}`.trimEnd());
     }
   }
   return out.join('\n');
 }
 
-function buildAutoBlock({ cwd, repoRoot, sessionId, turns }) {
+function buildAutoBlock({ cwd, repoRoot, sessionId, turns, excludeStatus }) {
   const multi = new Set(turns.map((t) => t.s)).size > 1;
   const turnLines = turns.length
     ? turns.map((t) => `- **${t.t}**${multi ? ` \`${t.s}\`` : ''} ${t.m}`).join('\n')
     : '- _no turns recorded yet_';
+
+  const warn =
+    excludeStatus === 'not-ignored'
+      ? [
+          '',
+          '> ⚠️ **This file is NOT ignored by git here.** It holds excerpts of your',
+          '> conversation, so it can be committed and pushed by a `git add -A`. Either it is',
+          '> already tracked, or `.git/info/exclude` could not be written. Set',
+          '> `WRITE_SESSION_LOCATION=home` to keep it out of the repo, or `WRITE_SESSION=0`.',
+        ]
+      : [];
 
   return [
     AUTO_START,
     '',
     '_Auto-maintained by the `write-session` Stop hook — regenerated every turn._',
     '_Do not hand-edit inside this block; everything below the end marker survives._',
+    ...warn,
     '',
-    `**Updated** ${stamp()} · **cwd** \`${cwd}\` · **session** \`${String(sessionId).slice(0, 8)}\``,
+    `**Updated** ${stamp()} · **cwd** \`${gitsafe(cwd)}\` · **session** \`${slug(sessionId).slice(0, 8)}\``,
     '',
     '## Git',
     '',
@@ -342,7 +806,9 @@ function buildAutoBlock({ cwd, repoRoot, sessionId, turns }) {
 
 function frame(title, autoBlock, narrative) {
   return [
-    `# SESSION — ${title}`,
+    // The title is a directory basename, i.e. attacker-influenceable on any machine
+    // where someone else can create a directory — same scrubbing as every other field.
+    `# SESSION — ${mdsafe(title)}`,
     '',
     '_Scratch state for resuming after `/clear`. Durable follow-ups belong in `TODOS.md`._',
     '',
@@ -357,16 +823,27 @@ function frame(title, autoBlock, narrative) {
   ].join('\n');
 }
 
-/** Replace only the auto region; preserve everything else byte-for-byte. */
+/**
+ * Replace only the auto region; preserve everything else byte-for-byte.
+ * Markers must sit alone on their line, and we splice at the LAST auto:end — both
+ * guard against a forged marker smuggled in through git metadata moving the boundary
+ * and leaving stale fragments (or fabricated narrative) behind in the file.
+ */
 function spliceAuto(existing, autoBlock, title) {
   if (existing) {
-    const s = existing.indexOf(AUTO_START);
-    const e = existing.indexOf(AUTO_END);
-    if (s !== -1 && e !== -1 && e > s) {
-      return existing.slice(0, s) + autoBlock + existing.slice(e + AUTO_END.length);
+    const startMatch = existing.match(RE_AUTO_START);
+    RE_AUTO_END.lastIndex = 0;
+    let endMatch = null;
+    for (let m = RE_AUTO_END.exec(existing); m; m = RE_AUTO_END.exec(existing)) endMatch = m;
+    if (startMatch && endMatch && endMatch.index > startMatch.index) {
+      return (
+        existing.slice(0, startMatch.index) +
+        autoBlock +
+        existing.slice(endMatch.index + endMatch[0].length)
+      );
     }
-    // File exists but has no markers (predates the hook, or something overwrote it
-    // wholesale). Adopt it: keep the body verbatim as the narrative, drop its H1.
+    // File exists but has no usable markers (predates the hook, or something overwrote
+    // it wholesale). Adopt it: keep the body verbatim as the narrative, drop its H1.
     const body = existing.replace(/^#\s+.*(\r?\n)+/, '').trim();
     return frame(title, autoBlock, body || NARRATIVE_SEED.trim());
   }
@@ -427,12 +904,26 @@ function main() {
   const title = repoRoot ? path.basename(repoRoot) : path.basename(cwd) || cwd;
 
   withLock(path.join(stateDir, '.lock'), () => {
-    if (inRepo && !isOff('WRITE_SESSION_GIT_EXCLUDE')) ensureExcluded(repoRoot);
+    let excludeStatus = 'skipped';
+    if (inRepo) {
+      excludeStatus = isOff('WRITE_SESSION_GIT_EXCLUDE')
+        ? gitOk(repoRoot, ['check-ignore', '-q', '--', 'SESSION.md'])
+          ? 'ok'
+          : 'not-ignored'
+        : ensureExcluded(repoRoot);
+    }
     const turns = readTurns(stateDir);
-    const autoBlock = buildAutoBlock({ cwd, repoRoot, sessionId, turns });
+    const autoBlock = buildAutoBlock({ cwd, repoRoot, sessionId, turns, excludeStatus });
     const existing = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '';
     writeAtomic(target, spliceAuto(existing, autoBlock, title));
   });
+
+  sweepStaleState(stateRoot);
+  // Gated on repoRoot, NOT inRepo: switching to WRITE_SESSION_LOCATION=home flips inRepo
+  // false while leaving any already-orphaned temp file sitting in the repo, and gating on
+  // the write path would strand it there permanently. Sweeping a repo we no longer write to
+  // is free and safe — the predicate matches only our own two name shapes, past an hour.
+  if (repoRoot) sweepRepoTmp(repoRoot);
 }
 
 try {
