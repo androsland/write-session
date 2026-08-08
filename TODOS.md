@@ -55,6 +55,25 @@
   accepted state at a far shorter timescale, since `withLock` fails open after `LOCK_WAIT_MS`
   (3 s) regardless. Fixing it properly means an owner-token lock, i.e. the same rewrite the
   `LOCK_STALE_MS` entry above calls for; do both or neither.
+- **The git half is silently empty when the session's cwd is not the repo being edited**
+  (measurement, 2026-08-08). The anchor is the working directory the session started in —
+  `repoRoot = git(cwd, ['rev-parse', '--show-toplevel'])`, then `anchor = repoRoot || cwd`
+  (`hooks/session-md.mjs:867,876`) — so a session launched from a home or scratch directory
+  that edits a repo somewhere else records `- Not a git repository (…)` for its entire life.
+  Branch, HEAD, dirty files and recent commits are all absent, and nothing in the file
+  indicates they were expected, so it reads as "this isn't a repo" rather than "the anchor
+  missed". Observed on a real session with a 6.3 MB transcript: the whole git block was that
+  one line while every edit landed in a repo two directories away. That is the free half of
+  the value proposition producing nothing, undetected.
+  Structurally hard rather than merely undocumented: the Stop payload carries `session_id`,
+  `transcript_path`, `cwd`, `hook_event_name`, `stop_hook_active` and
+  `last_assistant_message` and **no list of edited paths**, so the hook has no cheap way to
+  learn where the work actually went. Inferring it would mean parsing the transcript every
+  turn, which is precisely the cost this design exists to avoid. Recorded as a known limit
+  in the README rather than fixed; revisit if the payload ever grows an edited-files field,
+  or if some other cheap signal turns out to be available. Note that a fix would also have
+  to decide which repo wins when a session touches several — the current rule has the
+  virtue of being unambiguous.
 - **The ReDoS timing budget is wall-clock and machine-dependent** (build, 2026-08-08). The
   250 ms per-pattern budget and the 8x scaling ratio were calibrated on this machine; the
   worst pattern currently sits at ~11 ms, so there is ~23x headroom, but a much slower CI

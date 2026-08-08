@@ -309,6 +309,15 @@ or Linux for the full 207.
 
 ### Known limits, stated rather than implied
 
+- **The git half goes quiet if you start the session outside the repo you are editing.** The
+  anchor is the directory Claude Code was launched in, not wherever your edits land. Start it
+  in `~` and work on a project elsewhere and every turn records `Not a git repository` — no
+  branch, no HEAD, no dirty list, no recent commits — for the life of the session. Nothing in
+  the file marks the absence, so it reads as a correct answer about the wrong directory. The
+  hook is told where you started and what you last said; it is not told which files you
+  touched, so it cannot detect the mismatch without parsing the transcript every turn, which
+  is the cost this design exists to avoid. Launch Claude Code from inside the repo, or `cd`
+  there, if you want the free half to do anything. The narrative half is unaffected.
 - **A secret needs more than 256 characters between the keyword and the `=` to escape the
   assignment pattern** (`VERY_LONG_..._SECRET_..._NAME=value`). The bound exists because an
   unbounded span there is quadratic; 256 covers every realistic identifier, and the suite
