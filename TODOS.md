@@ -56,10 +56,11 @@
   (3 s) regardless. Fixing it properly means an owner-token lock, i.e. the same rewrite the
   `LOCK_STALE_MS` entry above calls for; do both or neither.
 - **The git half is silently empty when the session's cwd is not the repo being edited**
-  (measurement, 2026-08-08). The anchor is the working directory the session started in —
-  `repoRoot = git(cwd, ['rev-parse', '--show-toplevel'])`, then `anchor = repoRoot || cwd`
-  (`hooks/session-md.mjs:867,876`) — so a session launched from a home or scratch directory
-  that edits a repo somewhere else records `- Not a git repository (…)` for its entire life.
+  (measurement, 2026-08-08). The anchor is the working directory carried in that turn's Stop
+  payload — `const cwd = input.cwd || process.cwd()`, `repoRoot = git(cwd, ['rev-parse',
+  '--show-toplevel'])`, then `anchor = repoRoot || cwd` (`hooks/session-md.mjs:864,867,876`)
+  — so a session run from a home or scratch directory that edits a repo somewhere else
+  records `- Not a git repository (…)` for as long as it stays there.
   Branch, HEAD, dirty files and recent commits are all absent, and nothing in the file
   indicates they were expected, so it reads as "this isn't a repo" rather than "the anchor
   missed". Observed on a real session with a 6.3 MB transcript: the whole git block was that
@@ -74,6 +75,33 @@
   or if some other cheap signal turns out to be available. Note that a fix would also have
   to decide which repo wins when a session touches several — the current rule has the
   virtue of being unambiguous.
+- **A mid-session `cd` relocates `SESSION.md`, and the file left behind still looks current**
+  (measurement, 2026-08-08). Same anchor rule as the entry above, read from the other side:
+  because `cwd` comes from each turn's Stop payload rather than from where the session began,
+  a directory change moves `stateDir` for every subsequent turn. Outside a repo — where the
+  slug is the working directory itself — that means a second `~/.claude/write-session/<slug>/`
+  appears mid-session while the first freezes at whatever it last said. Neither file points at
+  the other and both are well-formed, so a resume that reads the original path silently gets
+  stale state. Observed on Windows: a session started in the user's home directory (not a
+  repo) wrote its `SESSION.md` under the home slug at 22:21; one turn ran `cd` into
+  `~/.claude/projects/<project>/` and at 22:28 a second state directory appeared, slugged
+  from that path, carrying its own `SESSION.md` and its own `turns-<sid>.json` — with no turn
+  file for that session left in the original directory. Inside a repo the anchor collapses to the repo root, so this is
+  invisible for ordinary in-repo work and fires only when a session crosses into a different
+  repo — but the plugin's documented home for a non-repo session is exactly the case that
+  breaks, and an *agent* running `cd` triggers it with the user never having typed one.
+  Not fixed, and the fix is a genuine trade-off rather than an oversight: pinning the anchor
+  to the first cwd seen for a session id would remove the relocation *and* remove the
+  `cd`-into-the-repo remedy the
+  README recommends for the empty-git-half limit above — the two behaviours are the same line
+  of code. Deciding which one wins needs a view on which failure is worse; recorded so the
+  next person changing that line knows both are riding on it. Note the state to implement a
+  pin does not exist yet: `turns-<sid>.json` is keyed by session but lives *inside* the
+  per-anchor directory, so once the anchor moves there is nothing left to read the original
+  cwd back from — it would need a new session-keyed record at the state root, and that is a
+  fourth thing for the sweep to age out. Blind spot either way: the hook
+  cannot tell an incidental `cd` from a real move of the work, so no rule here can be right
+  in every case. Documented in the README's known limits meanwhile.
 - **The ReDoS timing budget is wall-clock and machine-dependent** (build, 2026-08-08). The
   250 ms per-pattern budget and the 8x scaling ratio were calibrated on this machine; the
   worst pattern currently sits at ~11 ms, so there is ~23x headroom, but a much slower CI
