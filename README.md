@@ -309,15 +309,25 @@ or Linux for the full 207.
 
 ### Known limits, stated rather than implied
 
-- **The git half goes quiet if you start the session outside the repo you are editing.** The
-  anchor is the directory Claude Code was launched in, not wherever your edits land. Start it
-  in `~` and work on a project elsewhere and every turn records `Not a git repository` — no
-  branch, no HEAD, no dirty list, no recent commits — for the life of the session. Nothing in
+- **The git half goes quiet whenever your working directory is not the repo you are editing.**
+  The anchor is the working directory Claude Code reports at the end of each turn, not
+  wherever your edits land. Work out of `~` on a project elsewhere and every turn records
+  `Not a git repository` — no branch, no HEAD, no dirty list, no recent commits. Nothing in
   the file marks the absence, so it reads as a correct answer about the wrong directory. The
-  hook is told where you started and what you last said; it is not told which files you
-  touched, so it cannot detect the mismatch without parsing the transcript every turn, which
-  is the cost this design exists to avoid. Launch Claude Code from inside the repo, or `cd`
-  there, if you want the free half to do anything. The narrative half is unaffected.
+  hook is told where you are and what you last said; it is not told which files you touched,
+  so it cannot detect the mismatch without parsing the transcript every turn, which is the
+  cost this design exists to avoid. Launch Claude Code from inside the repo, or `cd` there,
+  if you want the free half to do anything. The narrative half is unaffected.
+- **That anchor is re-resolved every turn, so a `cd` also moves where the file is written.**
+  This is what makes the `cd` remedy above work, and it cuts both ways. Outside a repo the
+  state directory is slugged from the working directory itself, so a turn that changes
+  directory writes the next `SESSION.md` under a different `~/.claude/write-session/<slug>/`
+  and leaves the previous one frozen at whatever it last said. Both files look current; only
+  one is, and nothing in either points at the other. Inside a repo the anchor collapses to
+  the repo root, so moving around within one checkout is stable — stepping into a *different*
+  repo moves it just the same. If you resume by reading a fixed path, `cd` back before the
+  session ends. An agent that changes directory on your behalf can trigger this without you
+  ever typing `cd`.
 - **A secret needs more than 256 characters between the keyword and the `=` to escape the
   assignment pattern** (`VERY_LONG_..._SECRET_..._NAME=value`). The bound exists because an
   unbounded span there is quadratic; 256 covers every realistic identifier, and the suite
